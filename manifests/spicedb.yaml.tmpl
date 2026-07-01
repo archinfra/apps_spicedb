@@ -18,6 +18,7 @@ type: Opaque
 data:
   grpc-preshared-key: __GRPC_PRESHARED_KEY_B64__
   datastore-conn-uri: __DATASTORE_CONN_URI_B64__
+# __MIGRATION_JOB_START__
 ---
 apiVersion: batch/v1
 kind: Job
@@ -55,6 +56,7 @@ spec:
             secretKeyRef:
               name: spicedb-config
               key: datastore-conn-uri
+# __MIGRATION_JOB_END__
 ---
 apiVersion: v1
 kind: Service
