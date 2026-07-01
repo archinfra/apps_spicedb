@@ -101,6 +101,38 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: OnFailure
+# __POSTGRES_CREATEDB_JOB_START__
+      initContainers:
+      - name: wait-postgres-database
+        image: __POSTGRES_CLIENT_IMAGE__
+        imagePullPolicy: __IMAGE_PULL_POLICY__
+        command:
+        - /bin/sh
+        - -ec
+        - |
+          db="${SPICEDB_POSTGRES_DATABASE}"
+          echo "waiting for postgres database: ${db}"
+          i=0
+          until [ "$(psql "${SPICEDB_POSTGRES_ADMIN_CONN_URI}" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" 2>/dev/null || true)" = "1" ]; do
+            i=$((i + 1))
+            if [ "${i}" -ge 150 ]; then
+              echo "timed out waiting for postgres database: ${db}" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+        env:
+        - name: SPICEDB_POSTGRES_ADMIN_CONN_URI
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: postgres-admin-conn-uri
+        - name: SPICEDB_POSTGRES_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: postgres-database
+# __POSTGRES_CREATEDB_JOB_END__
       containers:
       - name: spicedb-migrate
         image: __SPICEDB_IMAGE__
