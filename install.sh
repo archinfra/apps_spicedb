@@ -113,9 +113,14 @@ extract_pg_database_from_uri() {
   esac
 }
 
-validate_pg_database_name() {
+validate_pg_database_identifier() {
   local db="$1"
   [[ "${db}" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "unsupported PostgreSQL database name '${db}'. Use letters, digits, underscore, or hyphen, and do not start with hyphen."
+}
+
+validate_pg_target_database_name() {
+  local db="$1"
+  validate_pg_database_identifier "${db}"
   case "${db}" in postgres|template0|template1) die "refusing to use reserved PostgreSQL database as SpiceDB target: ${db}" ;; esac
 }
 
@@ -203,8 +208,8 @@ if [[ "${CREATE_POSTGRES_DB}" == "true" ]]; then
   if [[ -z "${POSTGRES_DATABASE}" ]]; then
     POSTGRES_DATABASE="$(extract_pg_database_from_uri "${DATASTORE_CONN_URI}")" || die "cannot parse PostgreSQL database name from --datastore-conn-uri; pass --postgres-database explicitly"
   fi
-  validate_pg_database_name "${POSTGRES_DATABASE}"
-  validate_pg_database_name "${POSTGRES_ADMIN_DATABASE}"
+  validate_pg_target_database_name "${POSTGRES_DATABASE}"
+  validate_pg_database_identifier "${POSTGRES_ADMIN_DATABASE}"
   if [[ -z "${POSTGRES_ADMIN_CONN_URI}" ]]; then
     POSTGRES_ADMIN_CONN_URI="$(derive_pg_admin_conn_uri "${DATASTORE_CONN_URI}" "${POSTGRES_ADMIN_DATABASE}")"
   fi
