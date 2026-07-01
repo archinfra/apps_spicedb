@@ -18,6 +18,68 @@ type: Opaque
 data:
   grpc-preshared-key: __GRPC_PRESHARED_KEY_B64__
   datastore-conn-uri: __DATASTORE_CONN_URI_B64__
+  postgres-admin-conn-uri: __POSTGRES_ADMIN_CONN_URI_B64__
+  postgres-database: __POSTGRES_DATABASE_B64__
+# __POSTGRES_CREATEDB_JOB_START__
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spicedb-postgres-createdb
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+    app.kubernetes.io/component: postgres-createdb
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spicedb
+        app.kubernetes.io/instance: spicedb
+        app.kubernetes.io/component: postgres-createdb
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: postgres-createdb
+        image: __POSTGRES_CLIENT_IMAGE__
+        imagePullPolicy: __IMAGE_PULL_POLICY__
+        command:
+        - /bin/sh
+        - -ec
+        - |
+          db="${SPICEDB_POSTGRES_DATABASE}"
+          case "${db}" in
+            ""|postgres|template0|template1)
+              echo "invalid target database: ${db}" >&2
+              exit 1
+              ;;
+            *[!A-Za-z0-9_-]*)
+              echo "database name contains unsupported characters: ${db}" >&2
+              exit 1
+              ;;
+          esac
+          echo "checking postgres database: ${db}"
+          exists="$(psql "${SPICEDB_POSTGRES_ADMIN_CONN_URI}" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'")"
+          if [ "${exists}" = "1" ]; then
+            echo "database already exists: ${db}"
+          else
+            echo "creating database: ${db}"
+            psql "${SPICEDB_POSTGRES_ADMIN_CONN_URI}" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${db}\""
+          fi
+        env:
+        - name: SPICEDB_POSTGRES_ADMIN_CONN_URI
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: postgres-admin-conn-uri
+        - name: SPICEDB_POSTGRES_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: postgres-database
+# __POSTGRES_CREATEDB_JOB_END__
 # __MIGRATION_JOB_START__
 ---
 apiVersion: batch/v1
