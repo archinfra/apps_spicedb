@@ -8,11 +8,27 @@
     "tar": "spicedb-amd64.tar"
   },
   {
+    "name": "postgres-client",
+    "arch": "amd64",
+    "platform": "linux/amd64",
+    "pull": "docker.io/library/postgres:17-alpine",
+    "tag": "sealos.hub:5000/kube4/postgres/postgres:17-alpine",
+    "tar": "postgres-client-amd64.tar"
+  },
+  {
     "name": "spicedb",
     "arch": "arm64",
     "platform": "linux/arm64",
     "pull": "docker.io/authzed/spicedb:v1.54.0",
     "tag": "sealos.hub:5000/kube4/authzed/spicedb:v1.54.0",
     "tar": "spicedb-arm64.tar"
+  },
+  {
+    "name": "postgres-client",
+    "arch": "arm64",
+    "platform": "linux/arm64",
+    "pull": "docker.io/library/postgres:17-alpine",
+    "tag": "sealos.hub:5000/kube4/postgres/postgres:17-alpine",
+    "tar": "postgres-client-arm64.tar"
   }
 ]
