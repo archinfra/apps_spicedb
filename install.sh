@@ -7,6 +7,8 @@ DEFAULT_NAMESPACE="spicedb"
 DEFAULT_REPLICAS="2"
 DEFAULT_WAIT_TIMEOUT="300s"
 DEFAULT_SERVICE_TYPE="ClusterIP"
+DEFAULT_CREATE_POSTGRES_DB="true"
+DEFAULT_POSTGRES_ADMIN_DATABASE="postgres"
 
 ACTION="${1:-help}"
 if [[ $# -gt 0 ]]; then shift; fi
@@ -24,6 +26,10 @@ SKIP_IMAGE_PREPARE=0
 YES=0
 DELETE_NAMESPACE=0
 RUN_MIGRATION=1
+CREATE_POSTGRES_DB="${DEFAULT_CREATE_POSTGRES_DB}"
+POSTGRES_DATABASE=""
+POSTGRES_ADMIN_DATABASE="${DEFAULT_POSTGRES_ADMIN_DATABASE}"
+POSTGRES_ADMIN_CONN_URI=""
 DATASTORE_ENGINE="postgres"
 DATASTORE_CONN_URI=""
 GRPC_PRESHARED_KEY=""
@@ -42,7 +48,7 @@ Usage:
   ./spicedb-<version>-<arch>.run help
 
 Actions:
-  install      Extract payload, load/tag/push image, run datastore migration, and install SpiceDB.
+  install      Extract payload, load/tag/push images, create PostgreSQL database when needed, run datastore migration, and install SpiceDB.
   status       Show SpiceDB resources.
   uninstall    Delete SpiceDB resources. Namespace is kept unless --delete-namespace is set.
   help         Show this help.
@@ -51,12 +57,16 @@ Options:
   --registry <repo-prefix>             Target internal registry prefix. Default: ${DEFAULT_REGISTRY}
   --registry-user <user>               Registry username for docker login.
   --registry-pass <pass>               Registry password for docker login.
-  --skip-image-prepare                 Skip docker load/tag/push; still render image to --registry prefix.
+  --skip-image-prepare                 Skip docker load/tag/push; still render images to --registry prefix.
   -n, --namespace <namespace>          Kubernetes namespace. Default: ${DEFAULT_NAMESPACE}
   --replicas <n>                       Deployment replicas. Default: ${DEFAULT_REPLICAS}
   --datastore-engine <engine>          postgres, cockroachdb, mysql, spanner, or memory. Default: postgres
   --datastore-conn-uri <uri>           Remote datastore URI. Required unless --datastore-engine memory.
   --grpc-preshared-key <key>           Required client auth key for gRPC/HTTP APIs.
+  --create-postgres-db <true|false>    Auto-create target PostgreSQL database before migration. Default: ${DEFAULT_CREATE_POSTGRES_DB}
+  --postgres-database <name>           Target PostgreSQL database name. Defaults to value parsed from --datastore-conn-uri.
+  --postgres-admin-database <name>     Admin database used for CREATE DATABASE. Default: ${DEFAULT_POSTGRES_ADMIN_DATABASE}
+  --postgres-admin-conn-uri <uri>      Explicit admin PostgreSQL URI. Defaults to --datastore-conn-uri retargeted to --postgres-admin-database.
   --http-enabled <true|false>          Enable HTTP gateway. Default: true
   --service-type <type>                ClusterIP, NodePort, or LoadBalancer. Default: ClusterIP
   --nodeport-grpc <port>               Optional NodePort for gRPC port 50051.
@@ -86,6 +96,54 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*"; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+extract_pg_database_from_uri() {
+  local uri="$1" no_query db
+  case "${uri}" in
+    postgres://*|postgresql://*)
+      no_query="${uri%%\?*}"
+      db="${no_query##*/}"
+      [[ -n "${db}" && "${db}" != "${no_query}" ]] || return 1
+      printf '%s\n' "${db}"
+      ;;
+    *)
+      db="$(printf '%s' "${uri}" | sed -nE 's/.*(^|[[:space:]])(dbname|database)=([^[:space:]]+).*/\3/p' | head -n 1)"
+      [[ -n "${db}" ]] || return 1
+      printf '%s\n' "${db}"
+      ;;
+  esac
+}
+
+validate_pg_database_name() {
+  local db="$1"
+  [[ "${db}" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "unsupported PostgreSQL database name '${db}'. Use letters, digits, underscore, or hyphen, and do not start with hyphen."
+  case "${db}" in postgres|template0|template1) die "refusing to use reserved PostgreSQL database as SpiceDB target: ${db}" ;; esac
+}
+
+derive_pg_admin_conn_uri() {
+  local uri="$1" admin_db="$2" no_query query prefix
+  case "${uri}" in
+    postgres://*|postgresql://*)
+      if [[ "${uri}" == *\?* ]]; then
+        no_query="${uri%%\?*}"
+        query="?${uri#*\?}"
+      else
+        no_query="${uri}"
+        query=""
+      fi
+      prefix="${no_query%/*}"
+      [[ "${prefix}" != "${no_query}" ]] || die "cannot derive PostgreSQL admin URI from --datastore-conn-uri"
+      printf '%s/%s%s\n' "${prefix}" "${admin_db}" "${query}"
+      ;;
+    *)
+      if printf '%s' "${uri}" | grep -Eq '(^|[[:space:]])(dbname|database)='; then
+        printf '%s' "${uri}" | sed -E "s/(^|[[:space:]])(dbname|database)=[^[:space:]]+/\\1\\2=${admin_db}/"
+      else
+        printf '%s dbname=%s\n' "${uri}" "${admin_db}"
+      fi
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --registry) REGISTRY="${2:-}"; shift 2 ;;
@@ -97,6 +155,10 @@ while [[ $# -gt 0 ]]; do
     --datastore-engine) DATASTORE_ENGINE="${2:-}"; shift 2 ;;
     --datastore-conn-uri) DATASTORE_CONN_URI="${2:-}"; shift 2 ;;
     --grpc-preshared-key) GRPC_PRESHARED_KEY="${2:-}"; shift 2 ;;
+    --create-postgres-db) CREATE_POSTGRES_DB="${2:-}"; shift 2 ;;
+    --postgres-database) POSTGRES_DATABASE="${2:-}"; shift 2 ;;
+    --postgres-admin-database) POSTGRES_ADMIN_DATABASE="${2:-}"; shift 2 ;;
+    --postgres-admin-conn-uri) POSTGRES_ADMIN_CONN_URI="${2:-}"; shift 2 ;;
     --http-enabled) HTTP_ENABLED="${2:-}"; shift 2 ;;
     --service-type) SERVICE_TYPE="${2:-}"; shift 2 ;;
     --nodeport-grpc) NODEPORT_GRPC="${2:-}"; shift 2 ;;
@@ -122,6 +184,7 @@ if [[ "${ACTION}" == "help" ]]; then usage; exit 0; fi
 case "${SERVICE_TYPE}" in ClusterIP|NodePort|LoadBalancer) ;; *) die "--service-type must be ClusterIP, NodePort, or LoadBalancer" ;; esac
 case "${DATASTORE_ENGINE}" in postgres|cockroachdb|mysql|spanner|memory) ;; *) die "unsupported --datastore-engine: ${DATASTORE_ENGINE}" ;; esac
 case "${HTTP_ENABLED}" in true|false) ;; *) die "--http-enabled must be true or false" ;; esac
+case "${CREATE_POSTGRES_DB}" in true|false) ;; *) die "--create-postgres-db must be true or false" ;; esac
 if [[ -n "${NODEPORT_GRPC}" && "${SERVICE_TYPE}" != "NodePort" ]]; then die "--nodeport-grpc requires --service-type NodePort"; fi
 if [[ -n "${NODEPORT_HTTP}" && "${SERVICE_TYPE}" != "NodePort" ]]; then die "--nodeport-http requires --service-type NodePort"; fi
 if [[ "${ACTION}" == "install" ]]; then
@@ -132,6 +195,19 @@ if [[ "${ACTION}" == "install" ]]; then
 fi
 if [[ "${DATASTORE_ENGINE}" == "memory" ]]; then
   RUN_MIGRATION=0
+  CREATE_POSTGRES_DB=false
+elif [[ "${DATASTORE_ENGINE}" != "postgres" ]]; then
+  CREATE_POSTGRES_DB=false
+fi
+if [[ "${CREATE_POSTGRES_DB}" == "true" ]]; then
+  if [[ -z "${POSTGRES_DATABASE}" ]]; then
+    POSTGRES_DATABASE="$(extract_pg_database_from_uri "${DATASTORE_CONN_URI}")" || die "cannot parse PostgreSQL database name from --datastore-conn-uri; pass --postgres-database explicitly"
+  fi
+  validate_pg_database_name "${POSTGRES_DATABASE}"
+  validate_pg_database_name "${POSTGRES_ADMIN_DATABASE}"
+  if [[ -z "${POSTGRES_ADMIN_CONN_URI}" ]]; then
+    POSTGRES_ADMIN_CONN_URI="$(derive_pg_admin_conn_uri "${DATASTORE_CONN_URI}" "${POSTGRES_ADMIN_DATABASE}")"
+  fi
 fi
 
 payload_start_offset() {
@@ -164,7 +240,7 @@ confirm() {
   [[ "${YES}" == "1" ]] && return 0
   echo "About to ${ACTION} SpiceDB in namespace '${NAMESPACE}'."
   if [[ "${ACTION}" == "install" ]]; then
-    echo "datastore-engine=${DATASTORE_ENGINE}, replicas=${REPLICAS}, http-enabled=${HTTP_ENABLED}, run-migration=${RUN_MIGRATION}"
+    echo "datastore-engine=${DATASTORE_ENGINE}, replicas=${REPLICAS}, http-enabled=${HTTP_ENABLED}, create-postgres-db=${CREATE_POSTGRES_DB}, postgres-database=${POSTGRES_DATABASE:-n/a}, run-migration=${RUN_MIGRATION}"
   fi
   read -r -p "Continue? [y/N] " answer
   [[ "${answer}" == "y" || "${answer}" == "Y" ]] || die "aborted"
@@ -226,11 +302,17 @@ b64() {
 }
 
 render_manifest() {
-  local spicedb_image rendered grpc_key_b64 datastore_uri_b64 nodeport_grpc_line nodeport_http_line
+  local spicedb_image postgres_client_image rendered grpc_key_b64 datastore_uri_b64 postgres_admin_conn_uri_b64 postgres_database_b64 nodeport_grpc_line nodeport_http_line
   spicedb_image="$(target_ref_by_name spicedb)"
+  postgres_client_image=""
+  if [[ "${CREATE_POSTGRES_DB}" == "true" ]]; then
+    postgres_client_image="$(target_ref_by_name postgres-client)"
+  fi
   rendered="${WORKDIR}/rendered-spicedb.yaml"
   grpc_key_b64="$(b64 "${GRPC_PRESHARED_KEY}")"
   datastore_uri_b64="$(b64 "${DATASTORE_CONN_URI}")"
+  postgres_admin_conn_uri_b64="$(b64 "${POSTGRES_ADMIN_CONN_URI}")"
+  postgres_database_b64="$(b64 "${POSTGRES_DATABASE}")"
   nodeport_grpc_line=""
   nodeport_http_line=""
 
@@ -240,30 +322,40 @@ render_manifest() {
   awk \
     -v ns="${NAMESPACE}" \
     -v image="${spicedb_image}" \
+    -v postgres_client_image="${postgres_client_image}" \
     -v image_pull_policy="${IMAGE_PULL_POLICY}" \
     -v replicas="${REPLICAS}" \
     -v datastore_engine="${DATASTORE_ENGINE}" \
     -v datastore_uri_b64="${datastore_uri_b64}" \
+    -v postgres_admin_conn_uri_b64="${postgres_admin_conn_uri_b64}" \
+    -v postgres_database_b64="${postgres_database_b64}" \
     -v grpc_key_b64="${grpc_key_b64}" \
     -v http_enabled="${HTTP_ENABLED}" \
     -v service_type="${SERVICE_TYPE}" \
     -v log_level="${LOG_LEVEL}" \
     -v run_migration="${RUN_MIGRATION}" \
+    -v create_postgres_db="${CREATE_POSTGRES_DB}" \
     -v nodeport_grpc_line="${nodeport_grpc_line}" \
     -v nodeport_http_line="${nodeport_http_line}" \
     '
-      /__MIGRATION_JOB_START__/ { if (run_migration != "1") skip=1; next }
-      /__MIGRATION_JOB_END__/ { skip=0; next }
-      skip == 1 { next }
+      /__POSTGRES_CREATEDB_JOB_START__/ { if (create_postgres_db != "true") skip_createdb=1; next }
+      /__POSTGRES_CREATEDB_JOB_END__/ { skip_createdb=0; next }
+      skip_createdb == 1 { next }
+      /__MIGRATION_JOB_START__/ { if (run_migration != "1") skip_migration=1; next }
+      /__MIGRATION_JOB_END__/ { skip_migration=0; next }
+      skip_migration == 1 { next }
       /__NODEPORT_GRPC_LINE__/ { if (nodeport_grpc_line != "") print nodeport_grpc_line; next }
       /__NODEPORT_HTTP_LINE__/ { if (nodeport_http_line != "") print nodeport_http_line; next }
       {
         gsub(/__NAMESPACE__/, ns)
         gsub(/__SPICEDB_IMAGE__/, image)
+        gsub(/__POSTGRES_CLIENT_IMAGE__/, postgres_client_image)
         gsub(/__IMAGE_PULL_POLICY__/, image_pull_policy)
         gsub(/__REPLICAS__/, replicas)
         gsub(/__DATASTORE_ENGINE__/, datastore_engine)
         gsub(/__DATASTORE_CONN_URI_B64__/, datastore_uri_b64)
+        gsub(/__POSTGRES_ADMIN_CONN_URI_B64__/, postgres_admin_conn_uri_b64)
+        gsub(/__POSTGRES_DATABASE_B64__/, postgres_database_b64)
         gsub(/__GRPC_PRESHARED_KEY_B64__/, grpc_key_b64)
         gsub(/__HTTP_ENABLED__/, http_enabled)
         gsub(/__SERVICE_TYPE__/, service_type)
@@ -283,12 +375,20 @@ install_app() {
   prepare_images
   local rendered
   rendered="$(render_manifest)"
+  if [[ "${CREATE_POSTGRES_DB}" == "true" ]]; then
+    info "delete previous postgres database bootstrap job if present"
+    kubectl delete job spicedb-postgres-createdb -n "${NAMESPACE}" --ignore-not-found=true || true
+  fi
   if [[ "${RUN_MIGRATION}" == "1" ]]; then
     info "delete previous migration job if present"
     kubectl delete job spicedb-migrate -n "${NAMESPACE}" --ignore-not-found=true || true
   fi
   info "kubectl apply -f rendered manifest"
   kubectl apply -f "${rendered}"
+  if [[ "${CREATE_POSTGRES_DB}" == "true" ]]; then
+    info "waiting for spicedb-postgres-createdb job"
+    kubectl wait --for=condition=Complete job/spicedb-postgres-createdb -n "${NAMESPACE}" --timeout="${WAIT_TIMEOUT}"
+  fi
   if [[ "${RUN_MIGRATION}" == "1" ]]; then
     info "waiting for spicedb-migrate job"
     kubectl wait --for=condition=Complete job/spicedb-migrate -n "${NAMESPACE}" --timeout="${WAIT_TIMEOUT}"
