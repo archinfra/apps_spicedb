@@ -64,7 +64,7 @@ Options:
   --image-pull-policy <policy>         IfNotPresent, Always, or Never. Default: IfNotPresent
   --log-level <level>                  trace, debug, info, warn, error. Default: info
   --wait-timeout <duration>            Wait timeout. Default: ${DEFAULT_WAIT_TIMEOUT}
-  --skip-migration                     Do not run spicedb datastore migrate head.
+  --skip-migration                     Do not render or run spicedb datastore migrate head.
   --delete-namespace                   During uninstall, also delete namespace.
   -y, --yes                            Do not ask for confirmation.
   -h, --help                           Show this help.
@@ -164,7 +164,7 @@ confirm() {
   [[ "${YES}" == "1" ]] && return 0
   echo "About to ${ACTION} SpiceDB in namespace '${NAMESPACE}'."
   if [[ "${ACTION}" == "install" ]]; then
-    echo "datastore-engine=${DATASTORE_ENGINE}, replicas=${REPLICAS}, http-enabled=${HTTP_ENABLED}"
+    echo "datastore-engine=${DATASTORE_ENGINE}, replicas=${REPLICAS}, http-enabled=${HTTP_ENABLED}, run-migration=${RUN_MIGRATION}"
   fi
   read -r -p "Continue? [y/N] " answer
   [[ "${answer}" == "y" || "${answer}" == "Y" ]] || die "aborted"
@@ -225,10 +225,6 @@ b64() {
   printf '%s' "$1" | base64 | tr -d '\n'
 }
 
-escape_awk() {
-  printf '%s' "$1" | sed -e 's/[\\&]/\\&/g'
-}
-
 render_manifest() {
   local spicedb_image rendered grpc_key_b64 datastore_uri_b64 nodeport_grpc_line nodeport_http_line
   spicedb_image="$(target_ref_by_name spicedb)"
@@ -252,9 +248,13 @@ render_manifest() {
     -v http_enabled="${HTTP_ENABLED}" \
     -v service_type="${SERVICE_TYPE}" \
     -v log_level="${LOG_LEVEL}" \
+    -v run_migration="${RUN_MIGRATION}" \
     -v nodeport_grpc_line="${nodeport_grpc_line}" \
     -v nodeport_http_line="${nodeport_http_line}" \
     '
+      /__MIGRATION_JOB_START__/ { if (run_migration != "1") skip=1; next }
+      /__MIGRATION_JOB_END__/ { skip=0; next }
+      skip == 1 { next }
       /__NODEPORT_GRPC_LINE__/ { if (nodeport_grpc_line != "") print nodeport_grpc_line; next }
       /__NODEPORT_HTTP_LINE__/ { if (nodeport_http_line != "") print nodeport_http_line; next }
       {
