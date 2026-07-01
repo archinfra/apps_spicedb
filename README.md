@@ -2,11 +2,12 @@
 
 SpiceDB Kubernetes offline `.run` installer package.
 
-This package delivers the official SpiceDB container image as a self-extracting offline `.run` installer. The installer loads the image, retags it for an internal registry, pushes it, renders Kubernetes manifests, runs datastore migrations, and deploys SpiceDB.
+This package delivers the official SpiceDB container image as a self-extracting offline `.run` installer. The installer loads images, retags them for an internal registry, pushes them, renders Kubernetes manifests, creates the PostgreSQL database when needed, runs datastore migrations, and deploys SpiceDB.
 
 ## Version
 
 - SpiceDB: `v1.54.0`
+- PostgreSQL client image: `postgres:17-alpine`, used only for database bootstrap
 - default namespace: `spicedb`
 - default replicas: `2`
 - default datastore engine: `postgres`
@@ -20,6 +21,7 @@ The upstream changelog lists `1.54.0` as the latest released section at the time
 
 - Namespace
 - Secret: `spicedb-config`
+- PostgreSQL bootstrap Job: `spicedb-postgres-createdb`, only for `--datastore-engine postgres --create-postgres-db true`
 - Migration Job: `spicedb-migrate`
 - Service: `spicedb`
 - Deployment: `spicedb`
@@ -36,7 +38,7 @@ Metrics: 9090
 
 SpiceDB is not an authentication system. It is an authorization database inspired by Google Zanzibar. Your application writes schemas and relationships into SpiceDB, then asks SpiceDB whether a subject can perform an action on a resource.
 
-This installer does not deploy PostgreSQL. Production installs should use an external PostgreSQL, CockroachDB, MySQL, or Spanner datastore. The default path is PostgreSQL.
+This installer does not deploy PostgreSQL itself. Production installs should use an external PostgreSQL, CockroachDB, MySQL, or Spanner datastore. The default path is PostgreSQL.
 
 ## Build locally
 
@@ -82,21 +84,61 @@ Target host requirements:
 - `kubectl`
 - optional `sha256sum`, only for checking the `.sha256` file before running the installer
 
-The target host does **not** need `jq` or Python.
+The target host does **not** need `jq`, Python, or local `psql`.
 
-## Prepare PostgreSQL
+## PostgreSQL database bootstrap
 
-Create a PostgreSQL database first. Example connection string:
+By default, when `--datastore-engine postgres` is used, the installer will create the target database before running SpiceDB migrations.
+
+Example target connection string:
 
 ```text
 postgres://postgres:password@postgres.default.svc.cluster.local:5432/spicedb?sslmode=disable
 ```
 
-The installer will run:
+The installer derives:
+
+```text
+target database: spicedb
+admin database:  postgres
+admin URI:       postgres://postgres:password@postgres.default.svc.cluster.local:5432/postgres?sslmode=disable
+```
+
+Then it runs a Kubernetes Job with `postgres:17-alpine` and `psql`:
+
+```sql
+CREATE DATABASE "spicedb";
+```
+
+After that, it runs:
 
 ```bash
 spicedb datastore migrate head --datastore-engine postgres --datastore-conn-uri ...
 ```
+
+Supported PostgreSQL DSN formats:
+
+```text
+postgres://postgres:password@postgres.default.svc.cluster.local:5432/spicedb?sslmode=disable
+user=postgres password=password host=postgres.default.svc.cluster.local port=5432 dbname=spicedb sslmode=disable
+user=postgres password=password host=postgres.default.svc.cluster.local port=5432 database=spicedb sslmode=disable
+```
+
+When auto-parsing is not enough, pass these explicitly:
+
+```bash
+--postgres-database spicedb \
+--postgres-admin-database postgres \
+--postgres-admin-conn-uri 'postgres://postgres:password@postgres.default.svc.cluster.local:5432/postgres?sslmode=disable'
+```
+
+Disable automatic database creation:
+
+```bash
+--create-postgres-db false
+```
+
+In that case, create the database yourself before installation.
 
 ## Install
 
@@ -115,7 +157,9 @@ chmod +x spicedb-1.54.0-amd64.run
   -y
 ```
 
-If the target registry already contains the SpiceDB image:
+For your current error, the important part is that the URI should still point to the target DB `spicedb`; the installer will connect to the admin DB `postgres` only for the bootstrap Job.
+
+If the target registry already contains both images, SpiceDB and `postgres:17-alpine`:
 
 ```bash
 ./spicedb-1.54.0-amd64.run install \
@@ -156,7 +200,7 @@ For local smoke testing only:
   -y
 ```
 
-Memory mode is not persistent and skips datastore migration.
+Memory mode is not persistent and skips PostgreSQL bootstrap and datastore migration.
 
 ## Status
 
@@ -165,12 +209,18 @@ Memory mode is not persistent and skips datastore migration.
 kubectl get pods,svc,deploy,job -n spicedb -l app.kubernetes.io/name=spicedb
 ```
 
+Check logs:
+
+```bash
+kubectl logs -n spicedb job/spicedb-postgres-createdb
+kubectl logs -n spicedb job/spicedb-migrate
+kubectl logs -n spicedb deploy/spicedb
+```
+
 Check service:
 
 ```bash
 kubectl get svc -n spicedb spicedb
-kubectl logs -n spicedb deploy/spicedb
-kubectl logs -n spicedb job/spicedb-migrate
 ```
 
 ## Client access
@@ -207,10 +257,12 @@ The installer does not delete your external PostgreSQL database or SpiceDB table
 ## Production notes
 
 - Use a real datastore, preferably PostgreSQL or CockroachDB, not `memory`.
+- The PostgreSQL user in `--datastore-conn-uri` must have permission to create the target database when `--create-postgres-db true` is used.
+- If your production security policy separates admin and app DB users, pass `--postgres-admin-conn-uri` for database bootstrap and keep `--datastore-conn-uri` as the runtime SpiceDB user.
 - Use a long random `--grpc-preshared-key` and store it securely.
 - This package does not enable TLS by default. Put it behind trusted internal networking, service mesh, or an ingress/gateway with TLS.
 - Run migrations before serving traffic. The installer does this by default for non-memory datastores.
-- The official SpiceDB image uses a minimal userspace, so the Kubernetes manifest avoids `/bin/sh` and uses only image entrypoint args.
+- The official SpiceDB image uses a minimal userspace, so the Kubernetes manifest avoids `/bin/sh` in SpiceDB containers. The PostgreSQL bootstrap uses `postgres:17-alpine` because it intentionally needs `psql`.
 
 ## GitHub Actions
 
