@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spicedb-config
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+type: Opaque
+data:
+  grpc-preshared-key: __GRPC_PRESHARED_KEY_B64__
+  datastore-conn-uri: __DATASTORE_CONN_URI_B64__
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spicedb-migrate
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spicedb
+        app.kubernetes.io/instance: spicedb
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: spicedb-migrate
+        image: __SPICEDB_IMAGE__
+        imagePullPolicy: __IMAGE_PULL_POLICY__
+        args:
+        - datastore
+        - migrate
+        - head
+        - --datastore-engine=__DATASTORE_ENGINE__
+        - --datastore-conn-uri=$(SPICEDB_DATASTORE_CONN_URI)
+        - --log-level=__LOG_LEVEL__
+        env:
+        - name: SPICEDB_DATASTORE_CONN_URI
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: datastore-conn-uri
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+spec:
+  type: __SERVICE_TYPE__
+  selector:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+    app.kubernetes.io/component: server
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: grpc
+    protocol: TCP
+__NODEPORT_GRPC_LINE__
+  - name: http
+    port: 8443
+    targetPort: http
+    protocol: TCP
+__NODEPORT_HTTP_LINE__
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/instance: spicedb
+    app.kubernetes.io/component: server
+spec:
+  replicas: __REPLICAS__
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spicedb
+      app.kubernetes.io/instance: spicedb
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spicedb
+        app.kubernetes.io/instance: spicedb
+        app.kubernetes.io/component: server
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: spicedb
+        image: __SPICEDB_IMAGE__
+        imagePullPolicy: __IMAGE_PULL_POLICY__
+        args:
+        - serve
+        - --grpc-addr=:50051
+        - --grpc-preshared-key=$(SPICEDB_GRPC_PRESHARED_KEY)
+        - --http-enabled=__HTTP_ENABLED__
+        - --http-addr=:8443
+        - --metrics-enabled=true
+        - --metrics-addr=:9090
+        - --datastore-engine=__DATASTORE_ENGINE__
+        - --datastore-conn-uri=$(SPICEDB_DATASTORE_CONN_URI)
+        - --log-level=__LOG_LEVEL__
+        - --skip-release-check=true
+        ports:
+        - name: grpc
+          containerPort: 50051
+          protocol: TCP
+        - name: http
+          containerPort: 8443
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: SPICEDB_GRPC_PRESHARED_KEY
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: grpc-preshared-key
+        - name: SPICEDB_DATASTORE_CONN_URI
+          valueFrom:
+            secretKeyRef:
+              name: spicedb-config
+              key: datastore-conn-uri
+        readinessProbe:
+          tcpSocket:
+            port: grpc
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
+        livenessProbe:
+          tcpSocket:
+            port: grpc
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "2"
+            memory: 2Gi
